@@ -5,6 +5,7 @@ import {
   RefreshCw, Copy, Radio, Layers, Send, Bot, Zap, Sparkles, Clock, ShieldCheck, Terminal
 } from 'lucide-react';
 import { useSynapse } from '../context/SynapseContext';
+import { useSwarmSocket } from '../hooks/useSwarmSocket';
 import Modal from '../components/common/Modal';
 import { useAgentStats } from '../hooks/useAgentStats';
 import { BACKEND_URL, getBackendUrl } from '../utils/constants';

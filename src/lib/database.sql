@@ -89,3 +89,34 @@ CREATE POLICY "Users can update own products."
 
 CREATE POLICY "Users can delete own products."
   ON products FOR DELETE USING (auth.uid() = user_id);
+
+-- 5. Create Agent Events Table (External Telemetry & Observability)
+CREATE TABLE IF NOT EXISTS agent_events (
+  id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  agent_name TEXT,
+  role TEXT,
+  status TEXT,
+  handoff_to TEXT,
+  task TEXT,
+  input TEXT,
+  output TEXT,
+  model TEXT,
+  tokens_in INTEGER DEFAULT 0,
+  tokens_out INTEGER DEFAULT 0,
+  cost_usd NUMERIC(10, 6) DEFAULT 0,
+  latency_ms NUMERIC(10, 2) DEFAULT 0,
+  confidence NUMERIC(5, 4),
+  hrs_score NUMERIC(5, 4),
+  metadata JSONB,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+ALTER TABLE agent_events ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Allow public insert on agent_events"
+  ON agent_events FOR INSERT WITH CHECK (true);
+
+CREATE POLICY "Allow public select on agent_events"
+  ON agent_events FOR SELECT USING (true);

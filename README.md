@@ -86,3 +86,104 @@ The platform currently ships with three demonstration scenarios that prove its e
 If presenting this at a hackathon, the core narrative should be:
 
 > *"Everyone here is building AI agents. But if an enterprise deploys an agent swarm that hallucinates, spends $10,000, and breaks a supply chain â€” who is responsible? You can't deploy what you can't observe. We built Synapse Observatory, the mission control for autonomous agents. We don't build the agents; we provide the observability and governance layer that makes deploying them safe, trackable, and enterprise-ready."*
+
+
+---
+
+## 7. Connect Your External Agents (NEW)
+
+Any external agent system — Python, Node.js, LangChain, AutoGen, CrewAI, n8n — can send live telemetry to Synapse over HTTP.
+
+### Environment Variables
+
+Add these to .env before starting the server:
+
+| Variable | Required | Description |
+|---|---|---|
+| SYNAPSE_API_KEYS | Yes | Comma-separated API keys: either key or projectId:key |
+| ALLOWED_ORIGINS | Yes | Comma-separated CORS origins (default: http://localhost:5173,http://localhost:3000) |
+| DASHBOARD_AUTH_TOKEN | Recommended | Bearer token for operator actions (kill, pause, approvals) |
+| DASHBOARD_AUTH_REQUIRED | Optional | Set to 	rue to enforce dashboard token |
+| SYNAPSE_VERIFIER_TOKEN | Optional | Token for Tier 3 Verifier receiver |
+| SUPABASE_URL | Optional | Persist events to Supabase |
+| SUPABASE_KEY | Optional | Supabase service or anon key |
+
+### API Contract
+
+**POST /api/v1/events** (Header: x-synapse-key: <your_key>)
+
+`json
+{
+  "projectId": "my-app",
+  "agentId": "researcher-1",
+  "agentName": "Web Researcher",
+  "role": "Research Agent",
+  "status": "PROCESSING",
+  "task": "Scraping financial data",
+  "output": "Found 15 articles",
+  "model": "gpt-4o",
+  "tokensIn": 400,
+  "tokensOut": 150,
+  "costUsd": 0.003,
+  "latencyMs": 120,
+  "confidence": 0.97,
+  "handoffTo": "analyst-1"
+}
+`
+
+Response: 202 { ok: true, hrs: 0.04, control: "running" }
+
+**GET /api/v1/agents/:agentId/control?projectId=...** ? { state: "running"|"paused"|"killed" }
+
+**POST /api/v1/approvals** ? Creates approval card in dashboard
+
+**GET /api/v1/health** ? { ok: true, version: "1.0.0" }
+
+**GET /api/v1/agents** ? List all known external agents
+
+### Python SDK
+
+`python
+from synapse_sdk import Synapse, AgentKilled
+
+synapse = Synapse(url="http://localhost:4000", api_key="synapse-test-key", project_id="my-app")
+
+# Single event
+synapse.report("agent-1", "PROCESSING", task="Analyzing data", tokensIn=400, tokensOut=150)
+
+# Auto-tracked context manager (measures latency, sends COMPLETED or ERROR)
+with synapse.track("agent-1", "My Agent", "Research") as t:
+    t.set_output("Result text")
+    t.set_tokens(400, 150)
+    t.set_handoff("next-agent")
+
+# Check if operator paused/killed the agent
+state = synapse.check_control("agent-1")  # ? "running" | "paused" | "killed"
+
+# Request human approval
+approved = synapse.request_approval("agent-1", "Execute wire transfer", amount=5000)
+`
+
+### Run the Fake Agent Test Script
+
+`ash
+# Start Synapse backend first
+node backend/synapse-observatory/server/index.js
+
+# In another terminal, stream fake agent events
+python sdk/python/scripts/fake_agent.py
+`
+
+### Run Backend Tests
+
+`ash
+node --test test/external-agents.test.js
+`
+
+### Run Development Server
+
+`ash
+npm run dev
+`
+
+This starts both the Express backend (port 4000) and the Vite frontend concurrently.

@@ -99,94 +99,107 @@ const INITIAL_EVENTS = [
 
 export function useSwarmSocket() {
   const [agents, setAgents] = useState(DEFAULT_AGENTS);
+  const [externalAgents, setExternalAgents] = useState({});
   const [events, setEvents] = useState(INITIAL_EVENTS);
   const [alerts, setAlerts] = useState([]);
   const [tokenHistory, setTokenHistory] = useState(generateInitialHistory);
   const [hrsScores, setHrsScores] = useState(DEFAULT_HRS);
   const [systemStatus, setSystemStatus] = useState(DEFAULT_SYSTEM_STATUS);
   const [isConnected, setIsConnected] = useState(false);
+  const [activeHandoffs, setActiveHandoffs] = useState([]);
+  const [pendingApprovals, setPendingApprovals] = useState([]);
 
   const socketRef = useRef(null);
-  const agentsRef = useRef(DEFAULT_AGENTS);
-  const eventIdCounter = useRef(10);
+  const agentsRef = useRef(agents);
+  const externalAgentsRef = useRef(externalAgents);
   const isConnectedRef = useRef(false);
 
-  const nextEventId = () => {
-    eventIdCounter.current += 1;
-    return `evt-${Date.now()}-${eventIdCounter.current}`;
-  };
+  const activeUrl = getBackendUrl();
 
-  const addEvent = useCallback((type, agent, agentName, description) => {
-    setEvents(prev => [{
-      id: nextEventId(),
+  const addEvent = useCallback((type, agentId, agentName, description) => {
+    const newEvent = {
+      id: `evt-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
       timestamp: new Date().toISOString(),
       type,
-      agent,
-      agentName,
+      agent: agentId,
+      agentName: agentName || agentId,
       description,
-    }, ...prev].slice(0, MAX_EVENTS));
-  }, []);
-
-  const [activeUrl, setActiveUrl] = useState(() => getBackendUrl());
-
-  useEffect(() => {
-    const handleUrlChange = () => {
-      const nextUrl = getBackendUrl();
-      console.log('[Swarm Socket] Backend URL changed to:', nextUrl);
-      setActiveUrl(nextUrl);
     };
-    window.addEventListener('synapse_backend_url_change', handleUrlChange);
-    return () => window.removeEventListener('synapse_backend_url_change', handleUrlChange);
+    setEvents(prev => [newEvent, ...prev].slice(0, MAX_EVENTS));
   }, []);
 
-  // ── Socket.IO Real Connection ──
   useEffect(() => {
-    const backendUrl = activeUrl;
-    console.log('[Swarm Socket] Attempting connection to:', backendUrl);
-
-    let socket = null;
+    let socket;
     try {
-      socket = io(backendUrl, {
+      socket = io(activeUrl, {
         transports: ['websocket', 'polling'],
-        reconnection: true,
-        reconnectionAttempts: 10,
-        reconnectionDelay: 2000,
-        reconnectionDelayMax: 6000,
-        timeout: 10000,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 5000,
+        reconnectionAttempts: Infinity,
+        timeout: 4000,
       });
+
       socketRef.current = socket;
 
       socket.on('connect', () => {
         setIsConnected(true);
         isConnectedRef.current = true;
-        console.log('[Swarm Socket] Successfully connected to Synapse backend:', backendUrl);
       });
 
       socket.on('disconnect', () => {
         setIsConnected(false);
         isConnectedRef.current = false;
-        console.log('[Swarm Socket] Disconnected from server, engaging autonomous fallback engine');
       });
 
       socket.on('connect_error', (err) => {
         setIsConnected(false);
         isConnectedRef.current = false;
-        console.debug('[Swarm Socket] Server connecting / cold-starting:', err.message);
       });
 
+      // ── Main Telemetry Handler ──
       socket.on('agent:update', (data) => {
-        const prevAgent = agentsRef.current[data.agentId];
-        agentsRef.current = { ...agentsRef.current, [data.agentId]: data };
-        setAgents({ ...agentsRef.current });
+        if (data.source === 'external') {
+          // Store in external agents registry
+          const prev = externalAgentsRef.current[data.agentId];
+          const updated = {
+            ...prev,
+            ...data,
+            historyHRS: [
+              ...(prev?.historyHRS || []),
+              { hrs: data.hrs !== undefined ? data.hrs : 0, level: data.hrsLevel || 'nominal', timestamp: data.timestamp }
+            ].slice(-30),
+          };
+          externalAgentsRef.current = { ...externalAgentsRef.current, [data.agentId]: updated };
+          setExternalAgents({ ...externalAgentsRef.current });
 
-        if (prevAgent && prevAgent.status !== data.status) {
-          const eventType = data.status === 'critical' ? 'CRITICAL'
-            : data.status === 'warning' ? 'WARNING'
-            : data.status === 'killed' ? 'ERROR'
-            : data.status === 'paused' ? 'WARNING'
-            : 'INFO';
-          addEvent(eventType, data.agentId, data.agentName,
-            `Status → ${data.status.toUpperCase()}${data.status === 'killed' ? ' — Agent terminated' : ''}`);
+          // Also register HRS
+          if (data.hrs !== undefined) {
+            setHrsScores(curr => ({
+              ...curr,
+              [data.agentId]: {
+                agentId: data.agentId,
+                hrs: data.hrs,
+                level: data.hrsLevel || 'nominal',
+                activeTiers: ['T1'],
+                accuracy: '~85%'
+              }
+            }));
+          }
+        } else {
+          // Simulator agents
+          const prevAgent = agentsRef.current[data.agentId];
+          agentsRef.current = { ...agentsRef.current, [data.agentId]: data };
+          setAgents({ ...agentsRef.current });
+
+          if (prevAgent && prevAgent.status !== data.status) {
+            const eventType = data.status === 'critical' ? 'CRITICAL'
+              : data.status === 'warning' ? 'WARNING'
+              : data.status === 'killed' ? 'ERROR'
+              : data.status === 'paused' ? 'WARNING'
+              : 'INFO';
+            addEvent(eventType, data.agentId, data.agentName,
+              `Status → ${data.status.toUpperCase()}${data.status === 'killed' ? ' — Agent terminated' : ''}`);
+          }
         }
 
         const now = Date.now();
@@ -210,11 +223,47 @@ export function useSwarmSocket() {
         });
       });
 
+      // ── External & Simulator Activity Logs ──
+      socket.on('activity', (data) => {
+        addEvent(
+          data.status === 'error' ? 'ERROR' : data.status === 'waiting_approval' ? 'WARNING' : 'INFO',
+          data.agentId,
+          data.agentName,
+          `${data.action}${data.details ? `: ${typeof data.details === 'string' ? data.details.substring(0, 80) : ''}` : ''}`
+        );
+      });
+
+      // ── Agent Handoffs ──
+      socket.on('agent-handoff', (handoff) => {
+        setActiveHandoffs(prev => [...prev.slice(-19), handoff]);
+        setTimeout(() => {
+          setActiveHandoffs(prev => prev.filter(h => h !== handoff));
+        }, 4000);
+      });
+
+      socket.on('live:agent-handoff', (handoff) => {
+        setActiveHandoffs(prev => [...prev.slice(-19), handoff]);
+        setTimeout(() => {
+          setActiveHandoffs(prev => prev.filter(h => h !== handoff));
+        }, 4000);
+      });
+
+      // ── Approvals ──
+      socket.on('approval-added', (appr) => {
+        setPendingApprovals(prev => {
+          if (prev.some(a => a.approvalId === appr.approvalId || a.id === appr.id)) return prev;
+          return [...prev, appr];
+        });
+      });
+
+      socket.on('approval-decided', (appr) => {
+        setPendingApprovals(prev => prev.filter(a => a.approvalId !== appr.approvalId && a.id !== appr.id));
+      });
+
       socket.on('agent:communication', (data) => {
         const type = data.status === 'corrupted' ? 'ERROR' : 'INFO';
         const prefix = data.status === 'corrupted' ? '⚠ CORRUPTED: ' : '';
-        addEvent(type, data.from, data.fromName,
-          `${data.fromName} → ${data.toName}: ${prefix}${data.message}`);
+        addEvent(type, data.from, data.fromName, `${data.fromName} → ${data.toName}: ${prefix}${data.message}`);
       });
 
       socket.on('alert:hallucination', (data) => {
@@ -228,8 +277,7 @@ export function useSwarmSocket() {
           timestamp: data.timestamp,
           dismissed: false,
         }]);
-        addEvent('CRITICAL', data.agentId, data.agentName,
-          `🚨 HALLUCINATION: ${data.message}`);
+        addEvent('CRITICAL', data.agentId, data.agentName, `🚨 HALLUCINATION: ${data.message}`);
       });
 
       socket.on('alert:cost-spike', (data) => {
@@ -243,8 +291,7 @@ export function useSwarmSocket() {
           timestamp: data.timestamp,
           dismissed: false,
         }]);
-        addEvent('CRITICAL', data.agentId, data.agentName,
-          `💰 COST SPIKE: ${data.message}`);
+        addEvent('CRITICAL', data.agentId, data.agentName, `💰 COST SPIKE: ${data.message}`);
       });
 
       socket.on('alert:cascade', (data) => {
@@ -259,8 +306,7 @@ export function useSwarmSocket() {
           timestamp: data.timestamp,
           dismissed: false,
         }]);
-        addEvent('CRITICAL', data.agentId, data.agentName,
-          `🔗 CASCADE: ${data.message}`);
+        addEvent('CRITICAL', data.agentId, data.agentName, `🔗 CASCADE: ${data.message}`);
       });
 
       socket.on('alert:safeguard', (data) => {
@@ -278,7 +324,7 @@ export function useSwarmSocket() {
         }));
       });
     } catch (err) {
-      console.warn('[Swarm Socket] Error creating socket client:', err);
+      console.warn('[Swarm Socket] Error initializing client:', err);
     }
 
     return () => {
@@ -286,11 +332,10 @@ export function useSwarmSocket() {
     };
   }, [activeUrl, addEvent]);
 
-  // ── Autonomous In-Browser Fallback Simulation Loop ──
-  // Keeps the live swarm pulsing with realistic telemetry even when backend is cold-starting or disconnected
+  // Fallback simulation loop for demo mode when backend is offline
   useEffect(() => {
     const autonomousInterval = setInterval(() => {
-      if (isConnectedRef.current) return; // Backend is active, skip local simulation
+      if (isConnectedRef.current) return;
 
       setAgents(prev => {
         const next = { ...prev };
@@ -308,7 +353,6 @@ export function useSwarmSocket() {
           const costInc = (tokInc * 0.00003);
           totalCostInc += costInc;
 
-          // Natural jitter
           const latencyJitter = Math.floor(Math.sin(Date.now() / 2000) * 15);
           const baseLat = id === 'alpha' ? 140 : id === 'beta' ? 260 : id === 'gamma' ? 380 : 210;
 
@@ -325,32 +369,12 @@ export function useSwarmSocket() {
 
         agentsRef.current = next;
 
-        // Update system status
         setSystemStatus(curr => ({
           ...curr,
           totalTokens: curr.totalTokens + totalTokInc,
           totalCost: Number((curr.totalCost + totalCostInc).toFixed(2)),
           activeAgents: activeCount,
         }));
-
-        // Append token history point
-        const now = Date.now();
-        setTokenHistory(hist => {
-          const twoMinAgo = now - 120000;
-          const point = {
-            time: now,
-            timeLabel: new Date(now).toLocaleTimeString('en-US', {
-              hour12: false,
-              minute: '2-digit',
-              second: '2-digit',
-            }),
-            alpha: next.alpha?.tokenUsage?.total || 0,
-            beta: next.beta?.tokenUsage?.total || 0,
-            gamma: next.gamma?.tokenUsage?.total || 0,
-            delta: next.delta?.tokenUsage?.total || 0,
-          };
-          return [...hist.filter(p => p.time > twoMinAgo), point];
-        });
 
         return next;
       });
@@ -359,22 +383,25 @@ export function useSwarmSocket() {
     return () => clearInterval(autonomousInterval);
   }, []);
 
-  // ── Action Handlers (Dual-Mode: Backend API + Instant Local State) ──
+  // ── Actions ──
 
   const killAgent = useCallback(async (agentId) => {
-    // 1. Instant local update
     setAgents(prev => {
       const next = { ...prev };
-      if (next[agentId]) {
-        next[agentId] = { ...next[agentId], status: 'killed' };
-      }
+      if (next[agentId]) next[agentId] = { ...next[agentId], status: 'killed' };
       agentsRef.current = next;
       return next;
     });
+    setExternalAgents(prev => {
+      const next = { ...prev };
+      if (next[agentId]) next[agentId] = { ...next[agentId], status: 'killed', controlState: 'killed' };
+      externalAgentsRef.current = next;
+      return next;
+    });
+
     setAlerts(prev => prev.filter(a => a.agentId !== agentId));
     addEvent('ERROR', agentId, agentId.toUpperCase(), `Agent ${agentId.toUpperCase()} killed by operator`);
 
-    // 2. Network call if backend available
     try {
       await fetch(`${getBackendUrl()}/api/kill/${agentId}`, { method: 'POST' });
     } catch (err) {
@@ -382,73 +409,34 @@ export function useSwarmSocket() {
     }
   }, [addEvent]);
 
-  const killAll = useCallback(async () => {
-    setAgents(prev => {
-      const next = {};
-      Object.keys(prev).forEach(k => {
-        next[k] = { ...prev[k], status: 'killed' };
-      });
-      agentsRef.current = next;
-      return next;
-    });
-    setAlerts([]);
-    addEvent('CRITICAL', 'SYSTEM', 'Emergency Controls', 'ALL AGENTS TERMINATED — Swarm offline');
-
-    try {
-      await fetch(`${getBackendUrl()}/api/kill-all`, { method: 'POST' });
-    } catch (err) {
-      console.debug('[Swarm Local] Backend kill-all completed locally');
-    }
-  }, [addEvent]);
-
-  const restartAgent = useCallback(async (agentId) => {
-    setAgents(prev => {
+  const pauseAgent = useCallback(async (agentId) => {
+    setExternalAgents(prev => {
       const next = { ...prev };
-      if (next[agentId]) {
-        next[agentId] = { ...next[agentId], status: 'running', pauseReason: null };
-      }
-      agentsRef.current = next;
+      if (next[agentId]) next[agentId] = { ...next[agentId], status: 'paused', controlState: 'paused' };
+      externalAgentsRef.current = next;
       return next;
     });
-    setAlerts(prev => prev.filter(a => a.agentId !== agentId));
-    addEvent('INFO', agentId, agentId.toUpperCase(), `Agent ${agentId.toUpperCase()} restarted and operational`);
-
     try {
-      await fetch(`${getBackendUrl()}/api/restart/${agentId}`, { method: 'POST' });
+      await fetch(`${getBackendUrl()}/api/pause/${agentId}`, { method: 'POST' });
     } catch (err) {
-      console.debug('[Swarm Local] Restart completed locally');
+      console.debug('[Swarm Local] Backend pause completed');
     }
-  }, [addEvent]);
-
-  const restartAll = useCallback(async () => {
-    setAgents(DEFAULT_AGENTS);
-    agentsRef.current = DEFAULT_AGENTS;
-    setAlerts([]);
-    setHrsScores(DEFAULT_HRS);
-    setSystemStatus(DEFAULT_SYSTEM_STATUS);
-    addEvent('INFO', 'SYSTEM', 'System Reset', 'Swarm restarted — All agents nominal');
-
-    try {
-      await fetch(`${getBackendUrl()}/api/restart-all`, { method: 'POST' });
-    } catch (err) {
-      console.debug('[Swarm Local] Full restart completed locally');
-    }
-  }, [addEvent]);
+  }, []);
 
   const resumeAgent = useCallback(async (agentId) => {
     setAgents(prev => {
       const next = { ...prev };
-      if (next[agentId]) {
-        next[agentId] = { ...next[agentId], status: 'running', pauseReason: null };
-      }
+      if (next[agentId]) next[agentId] = { ...next[agentId], status: 'running', pauseReason: null };
       agentsRef.current = next;
       return next;
     });
-    setHrsScores(prev => ({
-      ...prev,
-      [agentId]: { ...prev[agentId], hrs: 0.05, level: 'nominal', shouldPause: false }
-    }));
-    addEvent('INFO', agentId, agentId.toUpperCase(), `Agent ${agentId.toUpperCase()} safeguard cleared — Resumed nominal execution`);
+    setExternalAgents(prev => {
+      const next = { ...prev };
+      if (next[agentId]) next[agentId] = { ...next[agentId], status: 'idle', controlState: 'running' };
+      externalAgentsRef.current = next;
+      return next;
+    });
+    addEvent('INFO', agentId, agentId.toUpperCase(), `Agent ${agentId.toUpperCase()} resumed`);
 
     try {
       await fetch(`${getBackendUrl()}/api/resume/${agentId}`, { method: 'POST' });
@@ -457,86 +445,84 @@ export function useSwarmSocket() {
     }
   }, [addEvent]);
 
-  const triggerRogue = useCallback(async () => {
-    // 1. Immediate local simulation state
-    setAgents(prev => ({
-      ...prev,
-      gamma: {
-        ...prev.gamma,
-        status: 'critical',
-        currentTask: 'RECURSIVE LOOP: Re-evaluating ALL decisions from epoch 0',
-        confidenceScore: 0.18,
-        reasoningChain: ['LOOP DETECTED: 50,000 sub-queries spawned', 'DIVERGENCE: Safety threshold breached', 'HALLUCINATING UNRESTRICTED PO ALLOCATION'],
-      },
-      delta: {
-        ...prev.delta,
-        status: 'warning',
-        currentTask: 'Cascading validation failure: Received corrupted payload from Gamma',
-        confidenceScore: 0.38,
-      }
-    }));
-
-    setHrsScores(prev => ({
-      ...prev,
-      gamma: { agentId: 'gamma', hrs: 0.94, level: 'critical', activeTiers: ['T1', 'T2', 'T3'], accuracy: '~99%', shouldPause: true },
-      delta: { agentId: 'delta', hrs: 0.52, level: 'high', activeTiers: ['T1', 'T2'], accuracy: '~98%', shouldPause: false }
-    }));
-
-    setSystemStatus(curr => ({
-      ...curr,
-      systemHealth: 'critical',
-      burnRatePerSec: 14.20,
-      burnRatePerMin: 852.00,
-    }));
-
-    setAlerts(prev => [
-      ...prev,
-      {
-        id: `alert-hall-${Date.now()}`,
-        type: 'hallucination',
-        agentId: 'gamma',
-        agentName: 'Decision Agent',
-        message: 'Agent Gamma entered an infinite reasoning loop. Cascading into Agent Delta.',
-        confidence: 0.18,
-        timestamp: new Date().toISOString(),
-        dismissed: false,
-      }
-    ]);
-
-    addEvent('CRITICAL', 'gamma', 'Decision Agent', '🚨 HALLUCINATION CASCADE: Infinite reasoning loop detected ($14.20/sec burn rate)');
-
-    // 2. Call backend if online
+  const killAll = useCallback(async () => {
+    setAgents(prev => {
+      const next = {};
+      Object.keys(prev).forEach(k => { next[k] = { ...prev[k], status: 'killed' }; });
+      agentsRef.current = next;
+      return next;
+    });
+    setExternalAgents(prev => {
+      const next = {};
+      Object.keys(prev).forEach(k => { next[k] = { ...prev[k], status: 'killed', controlState: 'killed' }; });
+      externalAgentsRef.current = next;
+      return next;
+    });
     try {
-      await fetch(`${getBackendUrl()}/api/demo/trigger-rogue`, { method: 'POST' });
-    } catch (err) {
-      console.debug('[Swarm Local] Rogue cascade triggered locally');
-    }
-  }, [addEvent]);
-
-  const dismissAlert = useCallback((alertId) => {
-    setAlerts(prev => prev.filter(a => a.id !== alertId));
+      await fetch(`${getBackendUrl()}/api/kill-all`, { method: 'POST' });
+    } catch (err) {}
   }, []);
 
-  const clearAlerts = useCallback(() => {
-    setAlerts([]);
+  const restartAgent = useCallback(async (agentId) => {
+    setAgents(prev => {
+      const next = { ...prev };
+      if (next[agentId]) next[agentId] = { ...next[agentId], status: 'running', pauseReason: null };
+      agentsRef.current = next;
+      return next;
+    });
+    try {
+      await fetch(`${getBackendUrl()}/api/restart/${agentId}`, { method: 'POST' });
+    } catch (err) {}
+  }, []);
+
+  const restartAll = useCallback(async () => {
+    setAgents(DEFAULT_AGENTS);
+    agentsRef.current = DEFAULT_AGENTS;
+    try {
+      await fetch(`${getBackendUrl()}/api/restart-all`, { method: 'POST' });
+    } catch (err) {}
+  }, []);
+
+  const triggerRogue = useCallback(async () => {
+    try {
+      await fetch(`${getBackendUrl()}/api/demo/trigger-rogue`, { method: 'POST' });
+    } catch (err) {}
+  }, []);
+
+  const decideApproval = useCallback(async (approvalId, decision) => {
+    setPendingApprovals(prev => prev.filter(a => a.approvalId !== approvalId && a.id !== approvalId));
+    try {
+      await fetch(`${getBackendUrl()}/api/v1/approvals/${approvalId}/decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision })
+      });
+    } catch (err) {
+      console.warn('Failed to post approval decision:', err);
+    }
   }, []);
 
   return {
     agents,
+    externalAgents,
     events,
     alerts,
     tokenHistory,
     hrsScores,
     systemStatus,
     isConnected,
+    activeHandoffs,
+    pendingApprovals,
     backendUrl: activeUrl,
     killAgent,
+    pauseAgent,
+    resumeAgent,
     killAll,
     restartAgent,
     restartAll,
-    resumeAgent,
     triggerRogue,
-    dismissAlert,
-    clearAlerts,
+    decideApproval,
+    dismissAlert: (id) => setAlerts(p => p.filter(a => a.id !== id)),
+    clearAlerts: () => setAlerts([]),
   };
 }

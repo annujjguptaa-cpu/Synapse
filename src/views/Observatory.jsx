@@ -5,31 +5,28 @@ import {
   Controls,
   useNodesState,
   useEdgesState,
-  Handle,
-  Position,
   MarkerType,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
+import dagre from 'dagre';
 import { useSynapse } from '../context/SynapseContext';
+import { useSwarmSocket } from '../hooks/useSwarmSocket';
 import { 
   Play, X, Eye, Activity, Clock, DollarSign, 
   CheckCircle2, AlertTriangle, Zap, ChevronDown, 
   ChevronUp, RotateCcw, Cpu, Send, Sparkles,
-  Radio, Bot
+  Radio, Bot, Layers, Shield
 } from 'lucide-react';
 import styles from './Observatory.module.css';
 
 import LiveSwarmView from '../components/liveswarm/LiveSwarmView';
-
 import { AgentNode } from '../components/observatory/AgentNode';
 import { TimelinePanel } from '../components/observatory/TimelinePanel';
 import { AgentDetailPanel } from '../components/observatory/AgentDetailPanel';
 
 const nodeTypes = { agentNode: AgentNode };
 
-// ═══════════════════════════════════════════
-// Edge definitions: which agents can communicate
-// ═══════════════════════════════════════════
+// Simulator default edges & layout
 const AGENT_EDGES = [
   { source: 'inventory', target: 'procurement', label: 'Low Stock Alert' },
   { source: 'procurement', target: 'finance', label: 'PO Validation' },
@@ -41,7 +38,6 @@ const AGENT_EDGES = [
   { source: 'pricing', target: 'logistics', label: 'Priority Signal' },
 ];
 
-// Constellation layout positions for agents
 const AGENT_POSITIONS = {
   inventory:   { x: 400, y: 80 },
   procurement: { x: 100, y: 300 },
@@ -50,114 +46,176 @@ const AGENT_POSITIONS = {
   pricing:     { x: 600, y: 550 },
 };
 
-// ═══════════════════════════════════════════
-// Main Observatory Component
-// ═══════════════════════════════════════════
+// Dagre layout helper for external agents graph
+const getLayoutedElements = (nodes, edges, direction = 'TB') => {
+  const dagreGraph = new dagre.graphlib.Graph();
+  dagreGraph.setDefaultEdgeLabel(() => ({}));
+
+  dagreGraph.setGraph({ rankdir: direction, ranksep: 80, nodesep: 60 });
+
+  nodes.forEach((node) => {
+    dagreGraph.setNode(node.id, { width: 200, height: 110 });
+  });
+
+  edges.forEach((edge) => {
+    dagreGraph.setEdge(edge.source, edge.target);
+  });
+
+  dagre.layout(dagreGraph);
+
+  const layoutedNodes = nodes.map((node) => {
+    const nodeWithPosition = dagreGraph.node(node.id);
+    return {
+      ...node,
+      position: {
+        x: nodeWithPosition ? nodeWithPosition.x - 100 : Math.random() * 400,
+        y: nodeWithPosition ? nodeWithPosition.y - 55 : Math.random() * 400,
+      },
+    };
+  });
+
+  return { nodes: layoutedNodes, edges };
+};
+
 export default function Observatory() {
   const {
     simulator,
     scenarios,
-    agentStatuses,
-    activityLog,
-    pendingApprovals,
+    agentStatuses: simAgentStatuses,
+    activityLog: simActivityLog,
+    pendingApprovals: simPendingApprovals,
     scenarioRunning,
     demoSteps,
-    activeHandoffs,
+    activeHandoffs: simActiveHandoffs,
     runScenario,
     runLiveScenario,
     runCustomPrompt,
     liveMode,
     liveTelemetry,
-    approveRequest,
-    rejectRequest,
+    approveRequest: simApproveRequest,
+    rejectRequest: simRejectRequest,
   } = useSynapse();
 
+  // Swarm socket hook (receives external agents & approvals)
+  const {
+    externalAgents,
+    events: externalEvents,
+    activeHandoffs: externalHandoffs,
+    pendingApprovals: externalApprovalsList,
+    killAgent,
+    pauseAgent,
+    resumeAgent,
+    decideApproval,
+  } = useSwarmSocket();
+
+  // Mode state: 'demo' (built-in simulator) or 'live' (only external agents)
+  const [dataMode, setDataMode] = useState('demo'); // 'demo' | 'live'
   const [selectedAgent, setSelectedAgent] = useState(null);
   const [timelineOpen, setTimelineOpen] = useState(false);
   const [activeEdges, setActiveEdges] = useState(new Set());
-  const [viewMode, setViewMode] = useState('live'); // 'live' or 'flow'
-  const [engineMode, setEngineMode] = useState('ai'); // 'ai' (real) or 'sim' (simulation)
+  const [viewMode, setViewMode] = useState('flow'); // 'flow' (ReactFlow) or 'grid' (LiveSwarmView)
+  const [engineMode, setEngineMode] = useState('ai');
   const [customPrompt, setCustomPrompt] = useState('');
   const [showCustomInput, setShowCustomInput] = useState(false);
+  const [externalEdgesList, setExternalEdgesList] = useState([]);
   const logEndRef = useRef(null);
   const customInputRef = useRef(null);
 
-  // Track which edges are active based on agent statuses + handoffs
+  // Track handoffs for external agents and dynamically create edges
   useEffect(() => {
-    const processing = new Set(
-      Object.entries(agentStatuses)
-        .filter(([_, a]) => a.status === 'processing')
-        .map(([id]) => id)
-    );
-
-    const edgeSet = new Set();
-    
-    // Light edges for processing agents
-    AGENT_EDGES.forEach(e => {
-      if (processing.has(e.source) || processing.has(e.target)) {
-        edgeSet.add(`${e.source}-${e.target}`);
-      }
-    });
-    
-    // Light edges for active handoffs
-    activeHandoffs.forEach(h => {
-      const edgeId = `${h.from}-${h.to}`;
-      edgeSet.add(edgeId);
-    });
-    
-    setActiveEdges(edgeSet);
-  }, [agentStatuses, activeHandoffs]);
-
-  // Open timeline when scenario starts
-  useEffect(() => {
-    if (scenarioRunning) setTimelineOpen(true);
-  }, [scenarioRunning]);
-
-  // Auto-scroll activity log
-  useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activityLog]);
-
-  // Focus custom input when shown
-  useEffect(() => {
-    if (showCustomInput && customInputRef.current) {
-      customInputRef.current.focus();
+    if (externalHandoffs.length > 0) {
+      setExternalEdgesList(prev => {
+        const next = [...prev];
+        externalHandoffs.forEach(h => {
+          const edgeId = `${h.from}-${h.to}`;
+          if (!next.some(e => e.id === edgeId)) {
+            next.push({
+              id: edgeId,
+              source: h.from,
+              target: h.to,
+              label: h.reason || 'Handoff',
+            });
+          }
+        });
+        return next;
+      });
     }
-  }, [showCustomInput]);
+  }, [externalHandoffs]);
 
-  // Handle scenario button click — routes to real AI or simulation
-  const handleRunScenario = useCallback((scenarioId) => {
-    if (engineMode === 'ai') {
-      runLiveScenario(scenarioId);
+  // Combine or filter agent statuses based on Demo / Live toggle
+  const currentAgentStatuses = useMemo(() => {
+    if (dataMode === 'live') {
+      // Return only external agents
+      return externalAgents;
+    }
+    // Return simulator agents in demo mode
+    return simAgentStatuses;
+  }, [dataMode, externalAgents, simAgentStatuses]);
+
+  const currentApprovals = useMemo(() => {
+    if (dataMode === 'live') {
+      return externalApprovalsList;
+    }
+    return simPendingApprovals;
+  }, [dataMode, externalApprovalsList, simPendingApprovals]);
+
+  const handleApprove = useCallback((id) => {
+    if (dataMode === 'live' || String(id).startsWith('appr-')) {
+      decideApproval(id, 'approved');
     } else {
-      runScenario(scenarioId);
+      simApproveRequest(id);
     }
-  }, [engineMode, runLiveScenario, runScenario]);
+  }, [dataMode, decideApproval, simApproveRequest]);
 
-  // Handle custom prompt submission
-  const handleCustomPrompt = useCallback(() => {
-    if (!customPrompt.trim()) return;
-    runCustomPrompt(customPrompt.trim());
-    setCustomPrompt('');
-    setShowCustomInput(false);
-  }, [customPrompt, runCustomPrompt]);
+  const handleReject = useCallback((id) => {
+    if (dataMode === 'live' || String(id).startsWith('appr-')) {
+      decideApproval(id, 'rejected');
+    } else {
+      simRejectRequest(id);
+    }
+  }, [dataMode, decideApproval, simRejectRequest]);
 
-  // Build React Flow nodes
   const handleNodeClick = useCallback((agentId) => {
     setSelectedAgent(prev => prev === agentId ? null : agentId);
   }, []);
 
-  const rfNodes = useMemo(() => {
-    return Object.entries(agentStatuses).map(([id, agent]) => ({
+  // Construct React Flow nodes and edges
+  const { rawNodes, rawEdges } = useMemo(() => {
+    if (dataMode === 'live') {
+      const extList = Object.values(externalAgents);
+      const generatedNodes = extList.map((agent) => ({
+        id: agent.agentId,
+        type: 'agentNode',
+        position: { x: 0, y: 0 },
+        data: { agent, onClick: handleNodeClick },
+      }));
+
+      const generatedEdges = externalEdgesList.map((e) => ({
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        label: e.label,
+        animated: true,
+        style: { stroke: '#06b6d4', strokeWidth: 2.5 },
+        markerEnd: { type: MarkerType.ArrowClosed, color: '#06b6d4' },
+      }));
+
+      if (generatedNodes.length > 0) {
+        const layouted = getLayoutedElements(generatedNodes, generatedEdges, 'TB');
+        return { rawNodes: layouted.nodes, rawEdges: layouted.edges };
+      }
+      return { rawNodes: [], rawEdges: [] };
+    }
+
+    // Demo Mode nodes
+    const simNodes = Object.entries(simAgentStatuses).map(([id, agent]) => ({
       id,
       type: 'agentNode',
       position: AGENT_POSITIONS[id] || { x: 400, y: 300 },
       data: { agent, onClick: handleNodeClick },
     }));
-  }, [agentStatuses, handleNodeClick]);
 
-  const rfEdges = useMemo(() => {
-    return AGENT_EDGES.map(e => {
+    const simEdges = AGENT_EDGES.map((e) => {
       const edgeId = `${e.source}-${e.target}`;
       const isActive = activeEdges.has(edgeId);
       return {
@@ -171,258 +229,146 @@ export default function Observatory() {
           strokeWidth: isActive ? 3 : 1.5,
           strokeDasharray: isActive ? '8 4' : 'none',
         },
-        labelStyle: {
-          fontSize: 10,
-          fontFamily: 'monospace',
-          fill: isActive ? '#0891b2' : 'transparent',
-          fontWeight: 600,
-        },
-        labelBgStyle: {
-          fill: isActive ? 'rgba(255,255,255,0.9)' : 'transparent',
-          stroke: isActive ? 'rgba(6,182,212,0.2)' : 'transparent',
-        },
         markerEnd: {
           type: MarkerType.ArrowClosed,
           color: isActive ? '#06b6d4' : 'rgba(0,0,0,0.12)',
-          width: 16,
-          height: 16,
         },
       };
     });
-  }, [activeEdges]);
 
-  const [nodes, setNodes, onNodesChange] = useNodesState(rfNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(rfEdges);
+    return { rawNodes: simNodes, rawEdges: simEdges };
+  }, [dataMode, externalAgents, externalEdgesList, simAgentStatuses, activeEdges, handleNodeClick]);
 
-  // Sync nodes/edges with real-time state
-  useEffect(() => {
-    setNodes(rfNodes);
-  }, [rfNodes, setNodes]);
+  const [nodes, setNodes, onNodesChange] = useNodesState(rawNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(rawEdges);
 
   useEffect(() => {
-    setEdges(rfEdges);
-  }, [rfEdges, setEdges]);
+    setNodes(rawNodes);
+  }, [rawNodes, setNodes]);
 
-  // Get logs for selected agent
+  useEffect(() => {
+    setEdges(rawEdges);
+  }, [rawEdges, setEdges]);
+
+  // Logs for selected agent
   const agentLogs = useMemo(() => {
     if (!selectedAgent) return [];
-    return activityLog.filter(l => l.agentId === selectedAgent).slice(-50);
-  }, [activityLog, selectedAgent]);
-
-  // Build timeline entries from demo steps — persist after scenario completes
-  const [lastScenarioId, setLastScenarioId] = useState(null);
-  
-  useEffect(() => {
-    if (scenarioRunning) setLastScenarioId(scenarioRunning);
-  }, [scenarioRunning]);
-  
-  const displayScenarioId = scenarioRunning || lastScenarioId;
-  const activeScenario = displayScenarioId ? scenarios[displayScenarioId] : null;
-  const timelineEntries = useMemo(() => {
-    if (!activeScenario) return [];
-    return activeScenario.steps.map((step, i) => ({
-      ...step,
-      status: demoSteps[i]?.status || 'pending',
-      output: demoSteps[i]?.output || null,
-    }));
-  }, [activeScenario, demoSteps]);
-
-  // Pending approval for detail panel
-  const agentApprovals = useMemo(() => {
-    return pendingApprovals.filter(a => a.status === 'pending');
-  }, [pendingApprovals]);
-
-  // Check if API key is set
-  const hasApiKey = !!localStorage.getItem('geminiApiKey');
+    if (dataMode === 'live') {
+      const agentObj = externalAgents[selectedAgent];
+      if (agentObj && agentObj.events) {
+        return agentObj.events.slice(-20);
+      }
+      return externalEvents.filter(e => e.agent === selectedAgent).slice(-20);
+    }
+    return simActivityLog.filter(l => l.agentId === selectedAgent).slice(-50);
+  }, [selectedAgent, dataMode, externalAgents, externalEvents, simActivityLog]);
 
   return (
     <div className="w-full h-full relative overflow-hidden flex flex-col bg-transparent">
-
-      {/* ── Scenario Launcher Bar ── */}
+      {/* ── Scenario / Swarm Mode Header Bar ── */}
       <div className={styles.scenarioBar}>
         <div className="flex items-center gap-2 mr-3 shrink-0">
           <Cpu size={16} className="text-black/50 dark:text-white/50" />
           <span className="text-sm font-bold text-black dark:text-white tracking-tight">Observatory</span>
         </div>
-        <div className="w-px h-6 bg-black/10 dark:bg-white/10 shrink-0 mr-1" />
 
-        {Object.entries(scenarios).map(([id, scenario]) => (
+        {/* Demo vs Live External Swarm Toggle */}
+        <div className="flex items-center bg-black/5 dark:bg-white/10 p-0.5 rounded-lg mr-3 shrink-0 border border-black/10 dark:border-white/10">
           <button
-            key={id}
-            onClick={() => handleRunScenario(id)}
-            disabled={!!scenarioRunning}
-            className={`${styles.scenarioCard} shrink-0 ${
-              scenarioRunning === id ? styles.scenarioCardActive : ''
-            } ${scenarioRunning && scenarioRunning !== id ? styles.scenarioCardDisabled : ''}`}
+            onClick={() => setDataMode('demo')}
+            className={`px-3 py-1 rounded-md text-xs font-bold transition-all flex items-center gap-1.5 ${
+              dataMode === 'demo'
+                ? 'bg-white dark:bg-black text-black dark:text-white shadow-sm'
+                : 'text-black/50 dark:text-white/50 hover:text-black dark:hover:text-white'
+            }`}
           >
-            <span className="text-base shrink-0">{scenario.icon}</span>
-            <span className="shrink-0">{scenario.title}</span>
-            {scenarioRunning === id && (
-              <div className="w-3 h-3 border-2 border-cyan-500 border-t-transparent animate-spin rounded-full shrink-0" />
-            )}
-            {!scenarioRunning && <Play size={12} className="opacity-40 shrink-0" />}
+            <span>Demo Swarm</span>
           </button>
-        ))}
+          <button
+            onClick={() => setDataMode('live')}
+            className={`px-3 py-1 rounded-md text-xs font-bold transition-all flex items-center gap-1.5 ${
+              dataMode === 'live'
+                ? 'bg-blue-600 text-white shadow-sm'
+                : 'text-black/50 dark:text-white/50 hover:text-black dark:hover:text-white'
+            }`}
+          >
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <span>Live External ({Object.keys(externalAgents).length})</span>
+          </button>
+        </div>
 
-        {/* ── Custom Prompt Button (NEW) ── */}
-        <button
-          onClick={() => setShowCustomInput(!showCustomInput)}
-          disabled={!!scenarioRunning || engineMode !== 'ai'}
-          className={`${styles.scenarioCard} shrink-0 ${showCustomInput ? styles.scenarioCardActive : ''} ${engineMode !== 'ai' ? 'opacity-40 cursor-not-allowed' : ''}`}
-          title={engineMode !== 'ai' ? 'Switch to LIVE AI mode to use custom prompts' : 'Ask agents anything'}
-        >
-          <Sparkles size={14} className="text-amber-400 shrink-0" />
-          <span>Custom</span>
-        </button>
+        <div className="w-px h-6 bg-black/10 dark:bg-white/10 shrink-0 mr-2" />
 
-        {/* ── Engine Mode Toggle + Status ── */}
-        <div className="ml-auto flex items-center gap-2 sm:gap-3 shrink-0">
-
-          {/* Engine Mode Toggle: AI vs Simulation */}
-          <div className="flex bg-black/5 dark:bg-white/5 rounded-lg p-0.5 sm:p-1 border border-black/10 dark:border-white/10 shrink-0">
-            <button
-              onClick={() => setEngineMode('ai')}
-              className={`px-2.5 sm:px-3 py-1 rounded-md text-xs font-bold transition-all flex items-center gap-1 sm:gap-1.5 ${
-                engineMode === 'ai' 
-                  ? 'bg-emerald-500 text-white shadow-sm shadow-emerald-500/30' 
-                  : 'text-black/60 dark:text-white/60 hover:text-black dark:hover:text-white'
-              }`}
-            >
-              <Sparkles size={11} />
-              LIVE AI
-            </button>
-            <button
-              onClick={() => setEngineMode('sim')}
-              className={`px-2.5 sm:px-3 py-1 rounded-md text-xs font-bold transition-all flex items-center gap-1 sm:gap-1.5 ${
-                engineMode === 'sim' 
-                  ? 'bg-cyan-500 text-white shadow-sm' 
-                  : 'text-black/60 dark:text-white/60 hover:text-black dark:hover:text-white'
-              }`}
-            >
-              <Bot size={11} />
-              Demo
-            </button>
+        {/* Show built-in scenario buttons only in Demo mode */}
+        {dataMode === 'demo' ? (
+          <div className="flex items-center gap-1.5 overflow-x-auto">
+            {Object.entries(scenarios).map(([id, scenario]) => (
+              <button
+                key={id}
+                onClick={() => (engineMode === 'ai' ? runLiveScenario(id) : runScenario(id))}
+                disabled={!!scenarioRunning}
+                className="px-2.5 py-1 text-xs rounded border border-black/10 dark:border-white/10 bg-white/40 dark:bg-black/30 hover:bg-white/70 text-black dark:text-white disabled:opacity-40 transition-colors"
+              >
+                {scenario.icon} {scenario.title}
+              </button>
+            ))}
           </div>
+        ) : (
+          <div className="flex items-center gap-3 text-xs font-mono text-black/60 dark:text-white/60">
+            <span>Ingesting events from <code className="bg-black/5 dark:bg-white/10 px-1 py-0.5 rounded text-blue-600 dark:text-blue-400">/api/v1/events</code></span>
+            <span>•</span>
+            <span>Active External Agents: <strong className="text-black dark:text-white">{Object.keys(externalAgents).length}</strong></span>
+          </div>
+        )}
 
-          {/* View Mode Toggle */}
-          <div className="flex bg-black/5 dark:bg-white/5 rounded-lg p-0.5 sm:p-1 border border-black/10 dark:border-white/10 shrink-0">
-            <button
-              onClick={() => setViewMode('live')}
-              className={`px-2.5 sm:px-3 py-1 rounded-md text-xs font-bold transition-all ${
-                viewMode === 'live' 
-                  ? 'bg-cyan-500 text-white shadow-sm' 
-                  : 'text-black/60 dark:text-white/60 hover:text-black dark:hover:text-white'
-              }`}
-            >
-              Live Swarm
-            </button>
+        <div className="ml-auto flex items-center gap-2 shrink-0">
+          <div className="flex bg-black/5 dark:bg-white/10 p-0.5 rounded">
             <button
               onClick={() => setViewMode('flow')}
-              className={`px-2.5 sm:px-3 py-1 rounded-md text-xs font-bold transition-all ${
-                viewMode === 'flow' 
-                  ? 'bg-cyan-500 text-white shadow-sm' 
-                  : 'text-black/60 dark:text-white/60 hover:text-black dark:hover:text-white'
-              }`}
+              className={`px-2 py-0.5 text-xs rounded ${viewMode === 'flow' ? 'bg-white dark:bg-black text-black dark:text-white' : 'text-black/50 dark:text-white/50'}`}
             >
-              Agent Flow
+              Graph Flow
             </button>
-          </div>
-
-          {/* Live AI Status Indicator */}
-          {engineMode === 'ai' && (
-            <div className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-md text-[11px] font-mono font-bold border shrink-0 ${
-              liveMode 
-                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                : hasApiKey
-                  ? 'bg-emerald-500/5 border-emerald-500/20 text-emerald-500/70'
-                  : 'bg-red-500/10 border-red-500/20 text-red-400'
-            }`}>
-              <div className={`w-2 h-2 rounded-full ${
-                liveMode 
-                  ? 'bg-emerald-400 animate-pulse shadow-[0_0_8px_rgba(52,211,153,0.6)]' 
-                  : hasApiKey
-                    ? 'bg-emerald-500'
-                    : 'bg-red-400'
-              }`} />
-              {liveMode ? 'AI RUNNING' : hasApiKey ? 'AI READY' : 'NO API KEY'}
-            </div>
-          )}
-
-          {/* Live Telemetry Badge */}
-          {liveTelemetry && (
-            <div className="flex items-center gap-2 px-2 py-1 bg-purple-500/10 border border-purple-500/20 rounded-md text-[10px] font-mono text-purple-400 shrink-0">
-              <span>{liveTelemetry.totalTokens} tok</span>
-              <span className="opacity-40">|</span>
-              <span>${liveTelemetry.totalCost?.toFixed(4)}</span>
-              <span className="opacity-40">|</span>
-              <span>{(liveTelemetry.totalLatency / 1000).toFixed(1)}s</span>
-            </div>
-          )}
-
-          {agentApprovals.length > 0 && (
-            <div className="flex items-center gap-1.5 px-2 py-1 bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-[11px] font-mono font-medium shrink-0">
-              <AlertTriangle size={12} />
-              {agentApprovals.length} pending
-            </div>
-          )}
-          <div className="flex items-center gap-1.5 text-[11px] font-mono text-black/50 dark:text-white/50 shrink-0">
-            <div className="w-2 h-2 bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.4)]" />
-            {Object.values(agentStatuses).filter(a => a.status !== 'offline').length} online
+            <button
+              onClick={() => setViewMode('grid')}
+              className={`px-2 py-0.5 text-xs rounded ${viewMode === 'grid' ? 'bg-white dark:bg-black text-black dark:text-white' : 'text-black/50 dark:text-white/50'}`}
+            >
+              Swarm Metrics
+            </button>
           </div>
         </div>
       </div>
 
-      {/* ── Custom Prompt Input Bar (NEW) ── */}
-      {showCustomInput && engineMode === 'ai' && (
-        <div className="px-3 sm:px-4 py-2 sm:py-3 bg-gradient-to-r from-amber-500/5 via-purple-500/5 to-cyan-500/5 border-b border-amber-500/20 dark:border-amber-500/10 flex items-center gap-2 sm:gap-3 backdrop-blur-xl">
-          <Sparkles size={16} className="text-amber-400 shrink-0" />
-          <input
-            ref={customInputRef}
-            type="text"
-            value={customPrompt}
-            onChange={(e) => setCustomPrompt(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                handleCustomPrompt();
-              }
-            }}
-            placeholder="Ask agents anything... e.g. 'A client cancelled order. What should we do?'"
-            disabled={!!scenarioRunning}
-            className="flex-1 min-w-0 bg-white/60 dark:bg-black/40 border border-black/10 dark:border-white/10 rounded-lg px-3 sm:px-4 py-1.5 sm:py-2 text-xs sm:text-sm text-black dark:text-white outline-none focus:border-amber-500/50 focus:ring-1 focus:ring-amber-500/30 transition-all placeholder:text-black/30 dark:placeholder:text-white/30 font-medium"
-          />
-          <button
-            onClick={handleCustomPrompt}
-            disabled={!customPrompt.trim() || !!scenarioRunning}
-            className="px-3 sm:px-4 py-1.5 sm:py-2 bg-gradient-to-r from-amber-500 to-orange-500 text-white rounded-lg text-xs sm:text-sm font-bold hover:shadow-lg hover:shadow-amber-500/25 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 shrink-0"
-          >
-            <Send size={13} />
-            Run
-          </button>
-          <button
-            onClick={() => setShowCustomInput(false)}
-            className="p-1.5 text-black/40 dark:text-white/40 hover:text-black dark:hover:text-white transition-colors shrink-0"
-          >
-            <X size={16} />
-          </button>
-        </div>
-      )}
-
-      {/* ── No API Key Warning ── */}
-      {engineMode === 'ai' && !hasApiKey && (
-        <div className="px-4 py-2 bg-red-500/10 border-b border-red-500/20 flex items-center gap-2 text-red-400 text-xs font-medium">
-          <AlertTriangle size={14} />
-          <span>No Gemini API key configured. Go to <strong>Settings → API Configuration</strong> to add your key.</span>
-        </div>
-      )}
-
-      {/* ── Main Content Area ── */}
-      {viewMode === 'live' ? (
+      {/* ── Main View Area ── */}
+      {viewMode === 'grid' ? (
         <div className="flex-1 w-full h-full bg-transparent overflow-hidden">
           <LiveSwarmView />
         </div>
       ) : (
         <div className={`flex-1 relative ${styles.canvas}`}>
+          {dataMode === 'live' && Object.keys(externalAgents).length === 0 ? (
+            <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center z-10 pointer-events-none">
+              <div className="max-w-md p-6 bg-white/80 dark:bg-black/80 backdrop-blur-md rounded-xl border border-black/10 dark:border-white/10 shadow-lg pointer-events-auto">
+                <div className="w-10 h-10 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center justify-center mx-auto mb-3">
+                  <Bot size={22} />
+                </div>
+                <h3 className="text-base font-bold text-black dark:text-white mb-1">Awaiting External Swarm Events</h3>
+                <p className="text-xs text-black/60 dark:text-white/60 mb-4 leading-relaxed">
+                  No external agents have reported yet. Connect any Python, Node, or LangChain agent using the Synapse SDK or HTTP API.
+                </p>
+                <div className="bg-black/5 dark:bg-white/5 p-3 rounded text-left font-mono text-[11px] text-black/70 dark:text-white/70 overflow-x-auto mb-3">
+                  <code>python sdk/python/scripts/fake_agent.py</code>
+                </div>
+                <button
+                  onClick={() => setDataMode('demo')}
+                  className="px-3 py-1.5 bg-black dark:bg-white text-white dark:text-black rounded text-xs font-semibold hover:opacity-90 transition-opacity"
+                >
+                  Switch to Demo Mode
+                </button>
+              </div>
+            </div>
+          ) : null}
+
           <ReactFlow
             nodes={nodes}
             edges={edges}
@@ -432,32 +378,27 @@ export default function Observatory() {
             fitView
             fitViewOptions={{ padding: 0.3 }}
             proOptions={{ hideAttribution: true }}
-            minZoom={0.3}
+            minZoom={0.2}
             maxZoom={1.5}
           >
             <Background gap={24} size={1} color="rgba(0,0,0,0.05)" />
             <Controls showInteractive={false} />
           </ReactFlow>
 
-          {/* ── Agent Detail Panel (Slide-in) ── */}
+          {/* ── Slide-in Agent Detail Panel ── */}
           <AgentDetailPanel
             selectedAgent={selectedAgent}
             setSelectedAgent={setSelectedAgent}
-            agentStatuses={agentStatuses}
-            agentApprovals={agentApprovals}
-            approveRequest={approveRequest}
-            rejectRequest={rejectRequest}
+            agentStatuses={currentAgentStatuses}
+            agentApprovals={currentApprovals}
+            approveRequest={handleApprove}
+            rejectRequest={handleReject}
             agentLogs={agentLogs}
             logEndRef={logEndRef}
-          />
-
-          {/* ── Timeline Panel ── */}
-          <TimelinePanel
-            timelineOpen={timelineOpen}
-            setTimelineOpen={setTimelineOpen}
-            timelineEntries={timelineEntries}
-            activeScenario={activeScenario}
-            scenarioRunning={scenarioRunning}
+            isExternal={dataMode === 'live'}
+            onKillAgent={killAgent}
+            onPauseAgent={pauseAgent}
+            onResumeAgent={resumeAgent}
           />
         </div>
       )}
