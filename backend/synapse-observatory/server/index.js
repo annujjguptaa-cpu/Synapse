@@ -117,8 +117,11 @@ function authenticateApiKey(req, res, next) {
 
   for (const entry of configuredKeys) {
     if (entry.includes(':')) {
-      const [pId, keyPart] = entry.split(':');
-      if (keyPart === apiKey) {
+      const colonIdx = entry.indexOf(':');
+      const pId = entry.slice(0, colonIdx);
+      const keyPart = entry.slice(colonIdx + 1);
+      // Accept both "just-the-key" and "projectId:key" formats from the client
+      if (keyPart === apiKey || entry === apiKey) {
         isAuthorized = true;
         keyProjectId = pId;
         break;
